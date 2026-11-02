@@ -39,7 +39,7 @@ mantidos na mesma pasta dos notebooks, preservando a estrutura do repositório.
 
 ## Repositório
 
-[Aceder ao repositório no GitHub](https://github.com/Diogo193/IA26_P01_G11)
+[Aceder ao repositório no GitHub](https://github.com/a31554/IA_PROJECT01_G11)
 
 O repositório deve ser partilhado com a conta institucional do docente
 (IPCA), conforme solicitado para a entrega.
