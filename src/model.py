@@ -4,7 +4,6 @@ import math
 
 
 class Vehicle:
-    """Veículo de entrega associado a um centro de recolha."""
     def __init__(self, vehicle_id, capacity_kg, speed_kmh, depot_loc, refrigerated=False):
         self.vehicle_id = vehicle_id
         self.capacity = capacity_kg
@@ -14,7 +13,6 @@ class Vehicle:
 
 
 class Request:
-    """Item de encomenda: recolher num produtor e entregar num cliente."""
     def __init__(self, item_id, order_id, product_id, weight,
                  pickup_loc, delivery_loc,
                  availability_start, availability_end,
@@ -30,7 +28,6 @@ class Request:
 
 
 class State:
-    """Estado da pesquisa informada."""
     def __init__(self, vi, loc, time, load, picked, delivered, stored, cost,
                  parent=None, action=None):
         self.vi, self.loc, self.time, self.load = vi, loc, time, load
@@ -38,13 +35,21 @@ class State:
         self.cost, self.parent, self.action = cost, parent, action
 
 
-class Problem:
-    """Carrega os dados e define as regras do problema.
+# --- helpers para o novo tipo de `stored` ---------------------------------
+def _is_stored(stored, item):
+    """True se `item` já passou pelo armazém (independente da representação)."""
+    return any(x == item for x, _ in stored)
 
-    via_depot=True  -> o produto tem de passar pelo armazém entre a recolha e a entrega
-                       (regra de modelação do grupo).
-    via_depot=False -> entrega direta produtor -> cliente (sem passagem obrigatória).
-    """
+
+def _get_arrival(stored, item):
+    """Instante de chegada ao armazém de `item`, ou None."""
+    for x, at in stored:
+        if x == item:
+            return at
+    return None
+
+
+class Problem:
     def __init__(self, data_path="data_tiny/", exclude_status=("delivered",),
                  drop_infeasible=True, verbose=True, via_depot=True):
         p = data_path.rstrip("/") + "/"
@@ -59,6 +64,13 @@ class Problem:
         self.vehicles_df = pd.read_csv(f"{p}vehicles.csv")
         dm = pd.read_csv(f"{p}distance_matrix.csv")
 
+        # --- NOVO: carregar as regras do dataset ---
+        rules_df = pd.read_csv(f"{p}rules.csv")
+        rules = dict(zip(rules_df.rule, rules_df.value))
+        self.stop_service_min = float(rules["stop_service_min"])
+        self.warehouse_handling_min = float(rules["warehouse_handling_min"])
+        self.max_warehouse_dwell_min = float(rules["max_warehouse_dwell_h"]) * 60.0
+
         self.dist = {(r.origin_location_id, r.destination_location_id):
                      (r.distance_km, r.duration_min) for r in dm.itertuples()}
         self.loc_id = {(r.location_type, r.ref_id): r.location_id
@@ -68,8 +80,6 @@ class Problem:
         self.requests = self._load_requests(exclude_status)
         self.req_by_id = {r.item_id: r for r in self.requests}
         self.veh_by_id = {v.vehicle_id: v for v in self.vehicles}
-        # depósito "principal" (usado só para apresentação); as heurísticas e as regras
-        # usam sempre o depósito de cada veículo, por isso vários centros são suportados
         self.depot = self.vehicles[0].depot_loc
         self.single_depot = len({v.depot_loc for v in self.vehicles}) == 1
 
@@ -123,32 +133,56 @@ class Problem:
 
     def move(self, vehicle, loc, t, load, onboard, stored, kind, item):
         """Aplica uma paragem (P = recolha, D = entrega) e devolve o novo estado
-        (loc, t, carga, km, armazenados) ou None se violar alguma restrição."""
+        (loc, t, carga, km, armazenados) ou None se violar alguma restrição.
+
+        `stored` é um frozenset de (item_id, arrival_time_em_minutos).
+        """
         r = self.req_by_id[item]
+
+        # ---------- RECOLHA ----------
         if kind == "P":
             d, m = self.travel(loc, r.pickup_loc)
-            t2 = max(t + m, r.availability_window[0])
-            if t2 > r.availability_window[1]:
+            t_service = max(t + m, r.availability_window[0])   # início do serviço
+            if t_service > r.availability_window[1]:
                 return None
             if load + r.weight > vehicle.capacity:
                 return None
-            return r.pickup_loc, t2, load + r.weight, d, stored
+            # + tempo de serviço no produtor
+            return r.pickup_loc, t_service + self.stop_service_min, load + r.weight, d, stored
+
+        # ---------- ENTREGA ----------
         if item not in onboard:
             return None
+
         km = 0.0
-        if self.via_depot and item not in stored:
+        if self.via_depot and not _is_stored(stored, item):
+            # 1) ir ao armazém
             d1, m1 = self.travel(loc, vehicle.depot_loc)
-            km, t, loc = d1, t + m1, vehicle.depot_loc
-            stored = frozenset(onboard)
-        d, m = self.travel(loc, r.delivery_loc)
-        t2 = max(t + m, r.delivery_window[0])
-        if t2 > r.delivery_window[1]:
+            km, loc = d1, vehicle.depot_loc
+            t_arrival = t + m1                                    # chegada ao armazém
+            t = t_arrival + self.warehouse_handling_min           # + handling
+            # guardar apenas os itens que ainda não estavam armazenados
+            new_items = [(x, t_arrival) for x in onboard if not _is_stored(stored, x)]
+            stored = frozenset(list(stored) + new_items)
+
+        # 2) verificar dwell no armazém (arrival → início do loading)
+        arrival = _get_arrival(stored, item)
+        if arrival is not None and (t - arrival) > self.max_warehouse_dwell_min + 1e-9:
             return None
-        return r.delivery_loc, t2, load - r.weight, km + d, stored - {item}
+
+        # 3) entregar
+        d, m = self.travel(loc, r.delivery_loc)
+        t_service = max(t + m, r.delivery_window[0])              # início do serviço
+        if t_service > r.delivery_window[1]:
+            return None
+        stored = frozenset((x, at) for x, at in stored if x != item)
+        return r.delivery_loc, t_service + self.stop_service_min, \
+               load - r.weight, km + d, stored
 
     def _simulate(self, route, vehicle):
         loc, t, load, km = vehicle.depot_loc, 0.0, 0.0, 0.0
-        picked, delivered, stored = frozenset(), frozenset(), frozenset()
+        picked, delivered = frozenset(), frozenset()
+        stored = frozenset()                                       # (item, arrival)
         for kind, item in route:
             if (kind == "P" and item in picked) or (kind == "D" and item in delivered):
                 return False, km
