@@ -1,3 +1,5 @@
+"""Pesquisa local: Hill Climbing (best improvement) com vizinhança relocate."""
+
 def _insertions(route, item):
     """Todas as rotas que resultam de inserir P(item) e D(item) (P antes de D)."""
     for i in range(len(route) + 1):

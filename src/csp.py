@@ -1,6 +1,21 @@
+"""CSP: atribuição de pedidos a veículos.
+
+Variáveis   X_i  = veículo que serve o pedido i
+Domínios    D(X_i) = veículos que conseguem servir o pedido i sozinho
+            (janelas de recolha/entrega, capacidade e regra do armazém)
+Restrições  unárias : o pedido cabe, sozinho, no veículo (filtra o domínio inicial)
+            binárias: se X_i = X_j = v, os dois pedidos têm de ter uma sequência viável em v
+                      (usada pelo AC-3)
+            globais : o conjunto de pedidos de cada veículo tem de admitir uma sequência de
+                      paragens viável (janelas + capacidade + precedência + armazém),
+                      verificada por find_sequence (usada no backtracking e no forward checking)
+Restrição suave: minimizar km (LCV) e, opcionalmente, equilibrar a carga entre veículos.
+"""
 import math
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from time import time as now
+
 
 @dataclass
 class CSPResult:
@@ -11,8 +26,13 @@ class CSPResult:
     backtracks: int
     seconds: float
     status: str
+    ac3_pruned: int = 0                      # valores removidos dos domínios pelo AC-3
+    domains: dict = field(default_factory=dict)  # domínios iniciais (após AC-3)
+
 
 def find_sequence(p, vehicle, ids, cap=20_000):
+    """Procura em profundidade uma sequência viável de paragens para `ids` num veículo.
+    Tenta primeiro a paragem cujo prazo fecha mais cedo."""
     budget, n_stops = [cap], 2 * len(ids)
 
     def rec(route, loc, t, load, picked, delivered, stored):
@@ -47,10 +67,11 @@ def find_sequence(p, vehicle, ids, cap=20_000):
 
     return rec([], vehicle.depot_loc, 0.0, 0.0, frozenset(), frozenset(), frozenset())
 
+
 def solve_csp(p, use_mrv=True, use_forward_checking=True, use_lcv=True,
-              max_backtracks=20_000):
+              use_ac3=True, balance_penalty_km=0.0, max_backtracks=20_000):
     t_start, cache = now(), {}
-    stats = {"nodes": 0, "bt": 0}
+    stats = {"nodes": 0, "bt": 0, "ac3": 0}
 
     def seq(vid, ids):
         key = (vid, frozenset(ids))
@@ -62,11 +83,33 @@ def solve_csp(p, use_mrv=True, use_forward_checking=True, use_lcv=True,
         s = seq(vid, ids)
         return None if s is None else p.cost_function(s, p.veh_by_id[vid])
 
+    # restrições unárias -> domínios iniciais
     domains = {r.item_id: [v.vehicle_id for v in p.vehicles if seq(v.vehicle_id, [r.item_id])]
                for r in p.requests}
 
     def members(assign, vid):
         return [i for i, v in assign.items() if v == vid]
+
+    # restrição binária: X_i = v e X_j = w são compatíveis?
+    def compatible(i, v, j, w):
+        return v != w or seq(v, [i, j]) is not None
+
+    def ac3(doms):
+        """Consistência de arco: remove de D(X_i) os valores sem suporte em D(X_j)."""
+        queue = deque((i, j) for i in doms for j in doms if i != j)
+        pruned = 0
+        while queue:
+            i, j = queue.popleft()
+            removed = [v for v in doms[i]
+                       if not any(compatible(i, v, j, w) for w in doms[j])]
+            if removed:
+                for v in removed:
+                    doms[i].remove(v)
+                pruned += len(removed)
+                if not doms[i]:
+                    return False, pruned
+                queue.extend((k, i) for k in doms if k not in (i, j))
+        return True, pruned
 
     def backtrack(assign, doms):
         if len(assign) == len(doms):
@@ -82,7 +125,9 @@ def solve_csp(p, use_mrv=True, use_forward_checking=True, use_lcv=True,
             def extra(v):
                 m = members(assign, v)
                 a, b = km(v, m + [i]), km(v, m)
-                return math.inf if a is None else a - (b or 0)
+                if a is None:
+                    return math.inf
+                return a - (b or 0) + balance_penalty_km * len(m)
             values.sort(key=extra)
         for v in values:
             stats["nodes"] += 1
@@ -112,12 +157,20 @@ def solve_csp(p, use_mrv=True, use_forward_checking=True, use_lcv=True,
 
     if any(not d for d in domains.values()):
         return CSPResult({}, {}, math.inf, 0, 0, now() - t_start, "no_solution")
+
+    if use_ac3:
+        ok, stats["ac3"] = ac3(domains)
+        if not ok:
+            return CSPResult({}, {}, math.inf, 0, 0, now() - t_start, "no_solution",
+                             stats["ac3"], domains)
+
+    initial = {k: list(v) for k, v in domains.items()}
     sol = backtrack({}, domains)
     if sol is None:
         status = "limit" if stats["bt"] > max_backtracks else "no_solution"
         return CSPResult({}, {}, math.inf, stats["nodes"], stats["bt"],
-                         now() - t_start, status)
+                         now() - t_start, status, stats["ac3"], initial)
     routes = {v.vehicle_id: seq(v.vehicle_id, members(sol, v.vehicle_id))
               for v in p.vehicles}
     return CSPResult(sol, routes, p.solution_cost(routes), stats["nodes"],
-                     stats["bt"], now() - t_start, "solved")
+                     stats["bt"], now() - t_start, "solved", stats["ac3"], initial)

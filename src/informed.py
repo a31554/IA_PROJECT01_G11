@@ -1,9 +1,11 @@
+"""Pesquisa informada (Greedy best-first e A*) com duas heurísticas."""
 import heapq
 import itertools
 import math
 from dataclasses import dataclass
 from time import time as now
 from model import State
+
 
 @dataclass
 class SearchResult:
@@ -13,53 +15,82 @@ class SearchResult:
     seconds: float
     status: str
 
+
+def _depots(p, vi):
+    """Depósito do veículo atual e dos veículos ainda por usar."""
+    return p.vehicles[vi].depot_loc, [v.depot_loc for v in p.vehicles[vi + 1:]]
+
+
 def h_admissible(p, vi, loc, picked, delivered, stored):
-    km, depot = (lambda a, b: p.travel(a, b)[0]), p.depot
+    """Máximo, sobre os pedidos por entregar, do mínimo de km que alguém tem de andar
+    para os servir. Não sobrestima (usa o máximo e não a soma) e respeita via_depot."""
+    km = lambda a, b: p.travel(a, b)[0]
+    depot, later = _depots(p, vi)
     best = km(loc, depot)
-    later = vi < len(p.vehicles) - 1
     for r in p.requests:
         i = r.item_id
         if i in delivered:
             continue
-        if i in stored:
-            b = km(loc, r.delivery_loc) + km(r.delivery_loc, depot)
-        elif i in picked:
-            b = km(loc, depot) + km(depot, r.delivery_loc) + km(r.delivery_loc, depot)
+        pk, dl = r.pickup_loc, r.delivery_loc
+        if p.via_depot:
+            if i in stored:
+                b = km(loc, dl) + km(dl, depot)
+            elif i in picked:
+                b = km(loc, depot) + km(depot, dl) + km(dl, depot)
+            else:
+                b = km(loc, pk) + km(pk, depot) + km(depot, dl) + km(dl, depot)
+                for d2 in later:
+                    b = min(b, km(d2, pk) + km(pk, d2) + km(d2, dl) + km(dl, d2))
         else:
-            b = km(loc, r.pickup_loc) + km(r.pickup_loc, depot) \
-                + km(depot, r.delivery_loc) + km(r.delivery_loc, depot)
-            if later:
-                b = min(b, km(depot, r.pickup_loc) + km(r.pickup_loc, depot)
-                        + km(depot, r.delivery_loc) + km(r.delivery_loc, depot))
+            if i in picked:
+                b = km(loc, dl) + km(dl, depot)
+            else:
+                b = km(loc, pk) + km(pk, dl) + km(dl, depot)
+                for d2 in later:
+                    b = min(b, km(d2, pk) + km(pk, dl) + km(dl, d2))
         best = max(best, b)
     return best
 
+
 def h_informative(p, vi, loc, picked, delivered, stored):
+    """Soma a viagem que falta a cada pedido + distância à paragem mais próxima.
+    Não é admissível (pode sobrestimar), mas orienta muito melhor a pesquisa."""
     km = lambda a, b: p.travel(a, b)[0]
-    depot = p.depot
+    depot, _ = _depots(p, vi)
     total, nearest = 0.0, math.inf
     for r in p.requests:
         i = r.item_id
         if i in delivered:
             continue
+        pk, dl = r.pickup_loc, r.delivery_loc
         if i in stored:
-            total += km(loc, r.delivery_loc)
-            nearest = min(nearest, km(loc, r.delivery_loc))
+            total += km(loc, dl)
+            nearest = min(nearest, km(loc, dl))
         elif i in picked:
-            total += km(depot, r.delivery_loc)
-            nearest = min(nearest, km(loc, depot))
+            if p.via_depot:
+                total += km(depot, dl)
+                nearest = min(nearest, km(loc, depot))
+            else:
+                total += km(loc, dl)
+                nearest = min(nearest, km(loc, dl))
         else:
-            total += km(r.pickup_loc, depot) + km(depot, r.delivery_loc)
-            nearest = min(nearest, km(loc, r.pickup_loc))
+            if p.via_depot:
+                total += km(pk, depot) + km(depot, dl)
+            else:
+                total += km(pk, dl)
+            nearest = min(nearest, km(loc, pk))
     return km(loc, depot) if nearest == math.inf else total + nearest
 
+
 def _dead(p, s):
+    """Estado sem saída: algum item a bordo já não chega a tempo à entrega ou, no último
+    veículo, algum pedido já não pode ser recolhido."""
     if s.vi >= len(p.vehicles):
         return False
     depot = p.vehicles[s.vi].depot_loc
     for i in s.picked - s.delivered:
         r = p.req_by_id[i]
-        if i in s.stored:
+        if (not p.via_depot) or i in s.stored:
             m = p.travel(s.loc, r.delivery_loc)[1]
         else:
             m = p.travel(s.loc, depot)[1] + p.travel(depot, r.delivery_loc)[1]
@@ -71,6 +102,7 @@ def _dead(p, s):
                s.time + p.travel(s.loc, r.pickup_loc)[1] > r.availability_window[1]:
                 return True
     return False
+
 
 def _successors(p, s):
     v = p.vehicles[s.vi]
@@ -102,6 +134,7 @@ def _successors(p, s):
                              s.delivered, frozenset(), s.cost + d, s, ("CLOSE", None)))
     return [c for c in out if not _dead(p, c)]
 
+
 def _routes_from(p, goal):
     routes = {v.vehicle_id: [] for v in p.vehicles}
     s = goal
@@ -112,8 +145,10 @@ def _routes_from(p, goal):
         s = s.parent
     return routes
 
+
 def informed_search(p, algorithm="astar", heuristic="admissible", w=1.0,
                     max_expansions=50_000):
+    """Greedy (f = h) ou A* / A* ponderado (f = g + w*h)."""
     h = h_admissible if heuristic == "admissible" else h_informative
     n, t_start, tie = len(p.vehicles), now(), itertools.count()
 

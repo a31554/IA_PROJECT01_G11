@@ -1,5 +1,7 @@
+"""Modelação do problema: entidades, custo e verificação de viabilidade."""
 import pandas as pd
 import math
+
 
 class Vehicle:
     """Veículo de entrega associado a um centro de recolha."""
@@ -9,6 +11,7 @@ class Vehicle:
         self.speed = speed_kmh
         self.depot_loc = depot_loc
         self.refrigerated = refrigerated
+
 
 class Request:
     """Item de encomenda: recolher num produtor e entregar num cliente."""
@@ -25,21 +28,27 @@ class Request:
         self.availability_window = (availability_start, availability_end)
         self.delivery_window = (delivery_start, delivery_end)
 
+
 class State:
-    """
-    Estado da pesquisa informada. 
-    """
+    """Estado da pesquisa informada."""
     def __init__(self, vi, loc, time, load, picked, delivered, stored, cost,
                  parent=None, action=None):
         self.vi, self.loc, self.time, self.load = vi, loc, time, load
         self.picked, self.delivered, self.stored = picked, delivered, stored
         self.cost, self.parent, self.action = cost, parent, action
 
+
 class Problem:
-    """Carrega os dados e define as regras do problema."""
+    """Carrega os dados e define as regras do problema.
+
+    via_depot=True  -> o produto tem de passar pelo armazém entre a recolha e a entrega
+                       (regra de modelação do grupo).
+    via_depot=False -> entrega direta produtor -> cliente (sem passagem obrigatória).
+    """
     def __init__(self, data_path="data_tiny/", exclude_status=("delivered",),
-                 drop_infeasible=True, verbose=True):
-        p = data_path
+                 drop_infeasible=True, verbose=True, via_depot=True):
+        p = data_path.rstrip("/") + "/"
+        self.via_depot = via_depot
         self.locations = pd.read_csv(f"{p}locations.csv")
         self.products = pd.read_csv(f"{p}products.csv")
         self.orders = pd.read_csv(f"{p}orders.csv")
@@ -59,7 +68,10 @@ class Problem:
         self.requests = self._load_requests(exclude_status)
         self.req_by_id = {r.item_id: r for r in self.requests}
         self.veh_by_id = {v.vehicle_id: v for v in self.vehicles}
+        # depósito "principal" (usado só para apresentação); as heurísticas e as regras
+        # usam sempre o depósito de cada veículo, por isso vários centros são suportados
         self.depot = self.vehicles[0].depot_loc
+        self.single_depot = len({v.depot_loc for v in self.vehicles}) == 1
 
         self.dropped = []
         if drop_infeasible:
@@ -110,6 +122,8 @@ class Problem:
         return (0.0, 0.0) if a == b else self.dist[(a, b)]
 
     def move(self, vehicle, loc, t, load, onboard, stored, kind, item):
+        """Aplica uma paragem (P = recolha, D = entrega) e devolve o novo estado
+        (loc, t, carga, km, armazenados) ou None se violar alguma restrição."""
         r = self.req_by_id[item]
         if kind == "P":
             d, m = self.travel(loc, r.pickup_loc)
@@ -122,7 +136,7 @@ class Problem:
         if item not in onboard:
             return None
         km = 0.0
-        if item not in stored:
+        if self.via_depot and item not in stored:
             d1, m1 = self.travel(loc, vehicle.depot_loc)
             km, t, loc = d1, t + m1, vehicle.depot_loc
             stored = frozenset(onboard)
